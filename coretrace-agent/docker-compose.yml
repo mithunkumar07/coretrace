@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  coretrace-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+      args:
+        VERSION: dev
+        BUILD_TIME: ${BUILD_TIME:-$(date -u +"%Y-%m-%dT%H:%M:%SZ")}
+        COMMIT_SHA: ${COMMIT_SHA:-local}
+    # image: coretrace/agent:dev
+    container_name: coretrace-agent-dev
+    privileged: true
+    volumes:
+      # Mount host logs for SSH monitoring
+      - /var/log:/var/log:ro
+      # Mount config file
+      - ./config.yaml:/etc/coretrace/config.yaml:ro
+      # Mount local binary for hot reload (optional)
+      - ./bin:/app/bin
+      # Mount proc for process monitoring
+      - /proc:/host/proc:ro
+    environment:
+      - DEBUG=true
+      - LOG_LEVEL=debug
+    networks:
+      - coretrace-net
+    restart: unless-stopped
+    # Override command for development
+    command: ["--debug"]
+
+  # Test container for SSH connections
+  ssh-test:
+    image: alpine:3.18
+    container_name: ssh-test-client
+    volumes:
+      - ./test-scripts:/test-scripts:ro
+    networks:
+      - coretrace-net
+    command: tail -f /dev/null
+    profiles:
+      - testing
+
+networks:
+  coretrace-net:
+    driver: bridge
+
+volumes:
+  logs:
+    driver: local

@@ -1,0 +1,60 @@
+# CoreTrace Agent Configuration
+
+# Agent settings
+agent:
+  name: "coretrace-agent"
+  version: "1.0.0"
+  debug: false
+
+# Logging configuration
+logging:
+  level: "info"  # debug, info, warn, error
+  format: "json" # json, console
+  output: "stdout" # stdout, stderr, file path
+
+# SSH monitoring settings
+ssh:
+  enabled: true
+  auth_log_paths:
+    - "/var/log/auth.log"
+    - "/var/log/secure"
+  session_timeout: "24h"
+  max_sessions: 1000
+
+# File monitoring settings
+file:
+  enabled: true
+  watch_paths:
+    - "/etc"
+    - "/home"
+    - "/root"
+    - "/var/log"
+    - "/opt"
+    - "/usr/local/bin"
+    - "/tmp"
+    - "/var/tmp"
+  exclude_patterns:
+    - "*.tmp"
+    - "*.log"
+    - ".git/*"
+    - "node_modules/*"
+    - ".cache/*"
+  max_watched_files: 10000
+
+# Event processing settings
+events:
+  buffer_size: 1000
+  flush_interval: "5s"
+  output_format: "json"
+
+# Geolocation settings (optional)
+geolocation:
+  enabled: false
+  provider: "ipapi" # ipapi, maxmind, ipstack
+  api_key: ""
+
+# Performance settings
+performance:
+  max_cpu_percent: 50
+  max_memory_mb: 512
+  gc_percent: 100

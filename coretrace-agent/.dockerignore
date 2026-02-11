@@ -1,0 +1,104 @@
+# Docker ignore patterns for CoreTrace Agent
+
+# Git
+.git
+.gitignore
+
+# Documentation
+README.md
+docs/
+*.md
+
+# Go build artifacts
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+coretrace-agent
+coretrace-agent-*
+
+# Test files
+*_test.go
+coverage.out
+coverage.html
+vendor/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Docker files (excluding the main one)
+docker-compose*.yml
+Dockerfile.*
+.dockerignore
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# Configuration examples
+config*.yaml
+!config.yaml
+
+# Development files
+Makefile
+.env
+.env.*
+
+# Local development
+local/
+dev/
+
+# Build artifacts
+*.tar.gz
+*.zip
+
+# Node modules (if any)
+node_modules/
+
+# Cache
+.cache/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Local binaries
+/bin/
+/usr/local/bin/coretrace-agent
+
+# Test coverage
+coverage.txt
+
+# Package files
+*.deb
+*.rpm
+
+# Release artifacts
+release/
+dist/
