@@ -31,7 +31,8 @@ func init() {
 }
 
 func startMonitoring() {
-	zapLogger, err := zap.NewProduction()
+	// Initialize logger from config
+	zapLogger, err := logger.NewLoggerFromConfig()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to initialize logger: %v\n", err)
 		os.Exit(1)

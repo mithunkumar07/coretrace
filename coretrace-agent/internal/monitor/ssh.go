@@ -28,8 +28,10 @@ func NewSSHMonitor(logger *zap.Logger, eventChan chan<- types.SSHEvent) *SSHMoni
 var (
 	// Accepted publickey for username from IP port N ssh2: RSA SHA256:...
 	sshAcceptedRegex = regexp.MustCompile(`^(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+\S+\s+sshd\[(\d+)\]:\s+Accepted\s+(\w+)\s+for\s+(\S+)\s+from\s+(\S+)\s+port\s+(\d+)\s+ssh2(?::\s+(.*))?`)
-	// Failed password for username from IP port N ssh2
+	// Failed password/publickey for username from IP port N ssh2
 	sshFailedRegex = regexp.MustCompile(`^(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+\S+\s+sshd\[\d+\]:\s+Failed\s+(\w+)\s+for\s+(\S+)\s+from\s+(\S+)\s+port\s+(\d+)\s+ssh2`)
+	// Connection closed by authenticating user (happens after multiple failed attempts)
+	sshConnClosedRegex = regexp.MustCompile(`^(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+\S+\s+sshd\[\d+\]:\s+Connection\s+closed\s+by\s+authenticating\s+user\s+(\S+)\s+(\S+)\s+port\s+(\d+)\s+\[.*\]`)
 	// pam_unix(sshd:session): session closed for user username
 	sshLogoutRegex = regexp.MustCompile(`^(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+\S+\s+sshd\[(\d+)\]:\s+pam_unix\(sshd:session\):\s+session\s+closed\s+for\s+user\s+(\S+)`)
 	// Extract fingerprint from key info (e.g., "RSA SHA256:abc123..." or "SHA256:abc123...")
@@ -79,10 +81,15 @@ func (sm *SSHMonitor) monitorAuthLog(ctx context.Context) {
 }
 
 func (sm *SSHMonitor) parseAuthLine(line string) {
+	sm.logger.Debug("Parsing auth line", zap.String("line", line))
+
 	if matches := sshAcceptedRegex.FindStringSubmatch(line); matches != nil {
 		sm.handleSSHLogin(matches, true)
 	} else if matches := sshFailedRegex.FindStringSubmatch(line); matches != nil {
+		sm.logger.Info("SSH failed login detected", zap.String("line", line))
 		sm.handleSSHLogin(matches, false)
+	} else if matches := sshConnClosedRegex.FindStringSubmatch(line); matches != nil {
+		sm.handleSSHAuthFailed(matches)
 	} else if matches := sshLogoutRegex.FindStringSubmatch(line); matches != nil {
 		sm.handleSSHLogout(matches)
 	}
@@ -167,6 +174,42 @@ func (sm *SSHMonitor) handleSSHLogout(matches []string) {
 		sm.logger.Debug("SSH logout event sent", zap.String("session_id", sessionID))
 	default:
 		sm.logger.Warn("Event channel full, dropping SSH logout event")
+	}
+}
+
+func (sm *SSHMonitor) handleSSHAuthFailed(matches []string) {
+	timestamp, err := time.Parse("Jan 2 15:04:05", fmt.Sprintf("%s %s", matches[1], time.Now().Format("2006")))
+	if err != nil {
+		sm.logger.Warn("Failed to parse timestamp", zap.Error(err))
+		timestamp = time.Now()
+	}
+
+	// matches: [0]=full, [1]=timestamp, [2]=username, [3]=sourceIP, [4]=port
+	username := matches[2]
+	sourceIP := matches[3]
+
+	sessionID := sm.generateSessionID(sourceIP, username, timestamp)
+
+	event := types.SSHEvent{
+		Timestamp:  timestamp,
+		EventType:  types.EventSSHFailed,
+		SessionID:  sessionID,
+		Username:   username,
+		SourceIP:   sourceIP,
+		Location:   sm.getLocationForIP(sourceIP),
+		AuthMethod: "publickey",
+		PID:        0,
+		Success:    false,
+	}
+
+	select {
+	case sm.eventChan <- event:
+		sm.logger.Info("SSH authentication failed - connection closed",
+			zap.String("session_id", sessionID),
+			zap.String("username", username),
+			zap.String("source_ip", sourceIP))
+	default:
+		sm.logger.Warn("Event channel full, dropping SSH auth failed event")
 	}
 }
 
