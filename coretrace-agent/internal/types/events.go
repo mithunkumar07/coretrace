@@ -78,3 +78,13 @@ type Session struct {
 	FileEvents     []FileEvent    `json:"file_events,omitempty"`
 	IsActive       bool           `json:"is_active"`
 }
+
+// DashboardEventMessage represents an event message for dashboard transmission
+type DashboardEventMessage struct {
+	Type      string                 `json:"type"`
+	Timestamp time.Time              `json:"timestamp"`
+	EventType string                 `json:"event_type,omitempty"`
+	SessionID string                 `json:"session_id,omitempty"`
+	Data      map[string]interface{} `json:"data"`
+	Severity  string                 `json:"severity,omitempty"`
+}
