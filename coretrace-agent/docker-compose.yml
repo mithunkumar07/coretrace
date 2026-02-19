@@ -1,52 +1,230 @@
-version: '3.8'
+
 
 services:
+  # CoreTrace Agent - Production
   coretrace-agent:
     build:
       context: .
       dockerfile: Dockerfile
-      target: development
+      args:
+        VERSION: ${VERSION:-dev}
+        BUILD_TIME: ${BUILD_TIME:-$(date -u +"%Y-%m-%dT%H:%M:%SZ")}
+        COMMIT_SHA: ${COMMIT_SHA:-local}
+    image: ${DOCKER_REGISTRY:-coretrace}/agent:${DOCKER_TAG:-dev}
+    container_name: coretrace-agent
+    privileged: true
+    volumes:
+      # Mount host logs for SSH monitoring
+      - /var/log:/var/log:ro
+      - /var/log/auth.log:/var/log/auth.log:ro
+      - /var/log/secure:/var/log/secure:ro
+      # Mount config file
+      - ./config.yaml:/etc/coretrace/config.yaml:ro
+      # Mount proc for process monitoring
+      - /proc:/host/proc:ro
+      # Mount system directory for file monitoring
+      - /etc:/host/etc:ro
+      - /home:/host/home:ro
+      - /root:/host/root:ro
+      - /opt:/host/opt:ro
+      - /usr/local/bin:/host/usr/local/bin:ro
+      - /tmp:/host/tmp
+      - /var/tmp:/host/var/tmp
+    environment:
+      - AGENT_NAME=${AGENT_NAME:-coretrace-agent}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - DEBUG=${DEBUG:-false}
+    networks:
+      - coretrace-net
+    restart: unless-stopped
+    # Explicit command to run monitor
+    command: ["monitor"]
+    # Health check
+    healthcheck:
+      test: ["CMD", "pgrep", "coretrace-agent"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    labels:
+      - "com.coretrace.service=agent"
+      - "com.coretrace.version=${VERSION:-dev}"
+      - "com.coretrace.environment=${ENVIRONMENT:-development}"
+
+  # CoreTrace Agent - Development
+  coretrace-agent-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
       args:
         VERSION: dev
         BUILD_TIME: ${BUILD_TIME:-$(date -u +"%Y-%m-%dT%H:%M:%SZ")}
         COMMIT_SHA: ${COMMIT_SHA:-local}
-    # image: coretrace/agent:dev
+    image: coretrace/agent:dev
     container_name: coretrace-agent-dev
     privileged: true
     volumes:
       # Mount host logs for SSH monitoring
       - /var/log:/var/log:ro
-      # Mount config file
-      - ./config.yaml:/etc/coretrace/config.yaml:ro
-      # Mount local binary for hot reload (optional)
-      - ./bin:/app/bin
+      - /var/log/auth.log:/var/log/auth.log:ro
+      - /var/log/secure:/var/log/secure:ro
+      # Mount config file (writable for development)
+      - ./config.yaml:/etc/coretrace/config.yaml
+      # Mount source code for hot reload
+      - .:/app
       # Mount proc for process monitoring
       - /proc:/host/proc:ro
+      # Development tools
+      - /usr/local/bin/go:/usr/local/bin/go:ro
     environment:
-      - DEBUG=true
+      - AGENT_NAME=coretrace-agent-dev
       - LOG_LEVEL=debug
+      - DEBUG=true
     networks:
       - coretrace-net
-    restart: unless-stopped
-    # Override command for development
-    command: ["--debug"]
+    restart: "no"
+    command: ["monitor", "--debug"]
+    profiles:
+      - dev
 
-  # Test container for SSH connections
-  ssh-test:
+  # CoreTrace Agent - Testing
+  coretrace-agent-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: test
+        BUILD_TIME: ${BUILD_TIME:-$(date -u +"%Y-%m-%dT%H:%M:%SZ")}
+        COMMIT_SHA: ${COMMIT_SHA:-test}
+    image: coretrace/agent:test
+    container_name: coretrace-agent-test
+    privileged: true
+    volumes:
+      # Test log directory
+      - ./test/logs:/var/log:ro
+      - ./test/config/test-config.yaml:/etc/coretrace/config.yaml:ro
+      # Test environment setup
+      - ./test/scripts:/test-scripts:ro
+      - /proc:/host/proc:ro
+    environment:
+      - AGENT_NAME=coretrace-agent-test
+      - LOG_LEVEL=debug
+      - DEBUG=true
+      - TEST_MODE=true
+    networks:
+      - coretrace-net
+    restart: "no"
+    command: ["monitor", "--debug"]
+    profiles:
+      - testing
+
+  # SSH Test Server - For testing SSH connections
+  ssh-test-server:
+    image: linuxserver/openssh-server:latest
+    container_name: ssh-test-server
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=UTC
+      - SUDO_ACCESS=false
+      - PASSWORD_ACCESS=true
+      - USER_PASSWORD=test123
+      - USER_NAME=testuser
+    volumes:
+      - ./test/ssh-config:/config
+    ports:
+      - "2222:2222"
+    networks:
+      - coretrace-net
+    restart: "no"
+    profiles:
+      - testing
+
+  # SSH Test Client - For making test connections
+  ssh-test-client:
     image: alpine:3.18
     container_name: ssh-test-client
     volumes:
-      - ./test-scripts:/test-scripts:ro
+      - ./test/scripts:/test-scripts:ro
     networks:
       - coretrace-net
     command: tail -f /dev/null
     profiles:
       - testing
 
+
+
+  # Collector Agent - For future integration
+  collector-agent:
+    image: ${DOCKER_REGISTRY:-coretrace}/collector:${COLLECTOR_TAG:-latest}
+    container_name: coretrace-collector
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./collector-data:/data
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgres://coretrace:password@postgres:5432/coretrace
+    networks:
+      - coretrace-net
+    depends_on:
+      - redis
+      - postgres
+    restart: unless-stopped
+    profiles:
+      - full
+
+  # Redis - For caching and message queue
+  redis:
+    image: redis:7-alpine
+    container_name: coretrace-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - coretrace-net
+    restart: unless-stopped
+    profiles:
+      - full
+
+  # PostgreSQL - For data storage
+  postgres:
+    image: postgres:15-alpine
+    container_name: coretrace-postgres
+    environment:
+      - POSTGRES_DB=coretrace
+      - POSTGRES_USER=coretrace
+      - POSTGRES_PASSWORD=password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./test/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - coretrace-net
+    restart: unless-stopped
+    profiles:
+      - full
+
 networks:
   coretrace-net:
     driver: bridge
+    labels:
+      - "com.coretrace.network=coretrace"
 
 volumes:
-  logs:
+  redis-data:
     driver: local
+    labels:
+      - "com.coretrace.volume=redis"
+  
+  postgres-data:
+    driver: local
+    labels:
+      - "com.coretrace.volume=postgres"
+  
+  collector-data:
+    driver: local
+    labels:
+      - "com.coretrace.volume=collector"

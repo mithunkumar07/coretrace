@@ -26,9 +26,14 @@ func NewSSHMonitor(logger *zap.Logger, eventChan chan<- types.SSHEvent) *SSHMoni
 }
 
 var (
-	sshAcceptedRegex = regexp.MustCompile(`^(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+\S+\s+sshd\[\d+\]:\s+Accepted\s+(\w+)\s+for\s+(\w+)\s+from\s+(\S+)\s+port\s+(\d+)\s+ssh2(\s+\[([^\]]+)\])?`)
-	sshFailedRegex   = regexp.MustCompile(`^(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+\S+\s+sshd\[\d+\]:\s+Failed\s+(\w+)\s+for\s+(\w+)\s+from\s+(\S+)\s+port\s+(\d+)\s+ssh2`)
-	sshLogoutRegex   = regexp.MustCompile(`^(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+\S+\s+sshd\[\d+\]:\s+pam_unix\(sshd:session\):\s+session\s+closed\s+for\s+user\s+(\w+)`)
+	// Accepted publickey for username from IP port N ssh2: RSA SHA256:...
+	sshAcceptedRegex = regexp.MustCompile(`^(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+\S+\s+sshd\[(\d+)\]:\s+Accepted\s+(\w+)\s+for\s+(\S+)\s+from\s+(\S+)\s+port\s+(\d+)\s+ssh2(?::\s+(.*))?`)
+	// Failed password for username from IP port N ssh2
+	sshFailedRegex = regexp.MustCompile(`^(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+\S+\s+sshd\[\d+\]:\s+Failed\s+(\w+)\s+for\s+(\S+)\s+from\s+(\S+)\s+port\s+(\d+)\s+ssh2`)
+	// pam_unix(sshd:session): session closed for user username
+	sshLogoutRegex = regexp.MustCompile(`^(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+\S+\s+sshd\[(\d+)\]:\s+pam_unix\(sshd:session\):\s+session\s+closed\s+for\s+user\s+(\S+)`)
+	// Extract fingerprint from key info (e.g., "RSA SHA256:abc123..." or "SHA256:abc123...")
+	fingerprintRegex = regexp.MustCompile(`(?:SHA256|MD5):[A-Za-z0-9+/=]+`)
 )
 
 func (sm *SSHMonitor) Start(ctx context.Context) error {
@@ -90,9 +95,14 @@ func (sm *SSHMonitor) handleSSHLogin(matches []string, success bool) {
 		timestamp = time.Now()
 	}
 
-	authMethod := matches[2]
-	username := matches[3]
-	sourceIP := matches[4]
+	// matches: [0]=full, [1]=timestamp, [2]=pid, [3]=authMethod, [4]=username, [5]=sourceIP, [6]=port, [7]=keyInfo
+	pid := 0
+	if len(matches) > 2 {
+		fmt.Sscanf(matches[2], "%d", &pid)
+	}
+	authMethod := matches[3]
+	username := matches[4]
+	sourceIP := matches[5]
 
 	sessionID := sm.generateSessionID(sourceIP, username, timestamp)
 
@@ -104,11 +114,16 @@ func (sm *SSHMonitor) handleSSHLogin(matches []string, success bool) {
 		SourceIP:   sourceIP,
 		Location:   sm.getLocationForIP(sourceIP),
 		AuthMethod: authMethod,
+		PID:        pid,
 		Success:    success,
 	}
 
-	if len(matches) > 6 && matches[7] != "" {
+	// Extract key fingerprint from the key info field (e.g., "RSA SHA256:abc123...")
+	if len(matches) > 7 && matches[7] != "" {
 		event.KeyFingerprint = sm.extractKeyFingerprint(matches[7])
+		sm.logger.Debug("Extracted key fingerprint",
+			zap.String("fingerprint", event.KeyFingerprint),
+			zap.String("raw_key_info", matches[7]))
 	}
 
 	if !success {
@@ -130,7 +145,12 @@ func (sm *SSHMonitor) handleSSHLogout(matches []string) {
 		timestamp = time.Now()
 	}
 
-	username := matches[2]
+	// matches: [0]=full, [1]=timestamp, [2]=pid, [3]=username
+	pid := 0
+	if len(matches) > 2 {
+		fmt.Sscanf(matches[2], "%d", &pid)
+	}
+	username := matches[3]
 	sessionID := sm.generateSessionID("", username, timestamp)
 
 	event := types.SSHEvent{
@@ -138,6 +158,7 @@ func (sm *SSHMonitor) handleSSHLogout(matches []string) {
 		EventType: types.EventSSHLogout,
 		SessionID: sessionID,
 		Username:  username,
+		PID:       pid,
 		Success:   true,
 	}
 
@@ -162,6 +183,10 @@ func (sm *SSHMonitor) getLocationForIP(ip string) types.Location {
 }
 
 func (sm *SSHMonitor) extractKeyFingerprint(fingerprintData string) string {
-	// TODO: Parse SSH key fingerprint from auth log
+	// Extract fingerprint from key info like "RSA SHA256:abc123..." or "SHA256:abc123..."
+	if matches := fingerprintRegex.FindStringSubmatch(fingerprintData); len(matches) > 0 {
+		return matches[0]
+	}
+	// Fallback: return the full data if we can't extract
 	return fingerprintData
 }

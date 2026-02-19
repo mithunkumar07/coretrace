@@ -1,0 +1,69 @@
+
+
+services:
+  coretrace-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${VERSION}
+        BUILD_TIME: ${BUILD_TIME}
+        COMMIT_SHA: ${COMMIT_SHA}
+    image: ${DOCKER_REGISTRY}/agent:${DOCKER_TAG}
+    container_name: coretrace-agent-prod
+    privileged: true
+    volumes:
+      # Host logs (read-only for security)
+      - /var/log:/var/log:ro
+      - /var/log/auth.log:/var/log/auth.log:ro
+      - /var/log/secure:/var/log/secure:ro
+      # Configuration (read-only)
+      - ./config.yaml:/etc/coretrace/config.yaml:ro
+      # System monitoring (read-only where possible)
+      - /proc:/host/proc:ro
+      - /etc:/host/etc:ro
+      - /home:/host/home:ro
+      - /root:/host/root:ro
+      - /opt:/host/opt:ro
+      - /usr/local/bin:/host/usr/local/bin:ro
+    environment:
+      - AGENT_NAME=${AGENT_NAME}
+      - LOG_LEVEL=${LOG_LEVEL}
+      - DEBUG=${DEBUG}
+    networks:
+      - coretrace-net
+    restart: always
+    healthcheck:
+      test: ["CMD", "pgrep", "coretrace-agent"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    # Explicit command to run monitor
+    command: ["monitor"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      - "traefik.enable=false"
+      - "com.coretrace.service=agent"
+      - "com.coretrace.version=${VERSION}"
+      - "com.coretrace.environment=production"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+          cpus: '0.25'
+
+networks:
+  coretrace-net:
+    driver: bridge
+    labels:
+      - "com.coretrace.network=coretrace"
+    driver_opts:
+      com.docker.network.bridge.name: coretrace-br0

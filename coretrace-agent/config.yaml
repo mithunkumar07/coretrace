@@ -6,6 +6,18 @@ agent:
   version: "1.0.0"
   debug: false
 
+# Command monitoring settings (requires auditd)
+command_monitoring:
+  enabled: true
+  # Audit log file path
+  audit_log_path: "/var/log/audit/audit.log"
+  # Alternative path if not using auditd
+  fallback_path: "/var/log/audit.log"
+  # How often to cleanup stale command records (seconds)
+  cleanup_interval: 30
+  # Enable debug logging for command parsing
+  debug: false
+
 # Logging configuration
 logging:
   level: "info"  # debug, info, warn, error
@@ -46,6 +58,27 @@ events:
   buffer_size: 1000
   flush_interval: "5s"
   output_format: "json"
+
+# Session logging settings
+session_logging:
+  enabled: true
+  # Directory where session logs are stored
+  sessions_dir: "/var/log/coretrace/sessions"
+  # Maximum time a session can be active before being force-closed
+  max_session_duration: "24h"
+  # How often to check for stale sessions
+  cleanup_interval: "1h"
+  
+  # Log rotation settings
+  rotation:
+    # Maximum size in megabytes before rotation
+    max_size_mb: 100
+    # Maximum number of old log files to retain
+    max_backups: 10
+    # Maximum number of days to retain old log files
+    max_age_days: 30
+    # Compress rotated files (gzip)
+    compress: true
 
 # Geolocation settings (optional)
 geolocation:

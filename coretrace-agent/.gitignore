@@ -1,2 +1,3 @@
 bin
 coretrace-agent
+.env
