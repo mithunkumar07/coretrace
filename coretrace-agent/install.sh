@@ -5,10 +5,14 @@ set -e
 # Repository: https://github.com/mithunkumar07/coretrace
 # Usage: curl -sSL https://raw.githubusercontent.com/mithunkumar07/coretrace/main/coretrace-agent/install.sh | sudo bash
 
-AGENT_VERSION="1.0.0"
+# Configuration
+AGENT_VERSION="${AGENT_VERSION:-1.0.4}"
+GITHUB_REPO="mithunkumar07/coretrace"
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/coretrace"
 LOG_DIR="/var/log/coretrace"
+TEMP_DIR=$(mktemp -d)
+trap "rm -rf $TEMP_DIR" EXIT
 
 # Colors for output
 RED='\033[0;31m'
@@ -75,36 +79,62 @@ chmod 755 "$LOG_DIR"
 log_info "Directories created"
 echo ""
 
-# Step 2: Check if binary exists locally or download
-if [ -f "./coretrace-agent" ]; then
-    log_step "Installing local binary..."
-    cp ./coretrace-agent "$INSTALL_DIR/coretrace-agent"
-    chmod +x "$INSTALL_DIR/coretrace-agent"
-    log_info "Local binary installed"
-else
-    log_step "Downloading CoreTrace Agent..."
+# Step 2: Download binary from GitHub releases
+log_step "Downloading CoreTrace Agent v${AGENT_VERSION}..."
+
+# Construct download URL
+BINARY_NAME="coretrace-agent-linux-${ARCH}"
+DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/v${AGENT_VERSION}/${BINARY_NAME}"
+CHECKSUM_URL="https://github.com/${GITHUB_REPO}/releases/download/v${AGENT_VERSION}/checksums.txt"
+
+log_info "Downloading from: ${DOWNLOAD_URL}"
+
+# Download binary with retry logic
+download_with_retry() {
+    local url=$1
+    local output=$2
+    local retries=3
+    local count=0
     
-    # For now, use local build or provide download URL
-    log_warn "Binary not found in current directory"
-    log_info "Please either:"
-    log_info "  1. Build the binary: go build -o coretrace-agent ."
-    log_info "  2. Download from releases: https://github.com/mithunkumar07/coretrace/releases"
-    log_info "  3. Place the binary in current directory and re-run this script"
-    
-    # Try to build if Go is available
-    if command -v go &> /dev/null && [ -f "main.go" ]; then
-        log_info "Attempting to build from source..."
-        go build -o coretrace-agent . || {
-            log_error "Build failed. Please build manually."
-            exit 1
-        }
-        cp ./coretrace-agent "$INSTALL_DIR/coretrace-agent"
-        chmod +x "$INSTALL_DIR/coretrace-agent"
-        log_info "Built and installed from source"
-    else
-        exit 1
-    fi
+    while [ $count -lt $retries ]; do
+        if curl -fsSL --connect-timeout 10 --max-time 60 "$url" -o "$output" 2>/dev/null; then
+            return 0
+        fi
+        count=$((count + 1))
+        log_warn "Download attempt $count failed, retrying..."
+        sleep 2
+    done
+    return 1
+}
+
+# Download binary
+if ! download_with_retry "$DOWNLOAD_URL" "${TEMP_DIR}/${BINARY_NAME}"; then
+    log_error "Failed to download binary after 3 attempts"
+    log_error "Please check:"
+    log_error "  - Version exists: https://github.com/${GITHUB_REPO}/releases/tag/v${AGENT_VERSION}"
+    log_error "  - Architecture supported: ${ARCH}"
+    exit 1
 fi
+
+# Download and verify checksum
+log_info "Verifying checksum..."
+if download_with_retry "$CHECKSUM_URL" "${TEMP_DIR}/checksums.txt"; then
+    cd "$TEMP_DIR"
+    if sha256sum -c checksums.txt --ignore-missing 2>/dev/null | grep -q "${BINARY_NAME}: OK"; then
+        log_info "Checksum verified"
+    else
+        log_warn "Checksum verification failed, but continuing with installation"
+    fi
+    cd - > /dev/null
+else
+    log_warn "Could not download checksums, skipping verification"
+fi
+
+# Install binary
+log_info "Installing binary to ${INSTALL_DIR}..."
+cp "${TEMP_DIR}/${BINARY_NAME}" "$INSTALL_DIR/coretrace-agent"
+chmod +x "$INSTALL_DIR/coretrace-agent"
+log_info "Binary installed successfully"
 echo ""
 
 # Step 3: Create config
