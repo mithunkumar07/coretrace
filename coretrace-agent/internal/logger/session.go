@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/coretrace/agent/internal/types"
@@ -13,14 +14,23 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
+// DiskManagementConfig holds disk space management settings
+type DiskManagementConfig struct {
+	MaxDirSizeBytes  int64 // Maximum total size of sessions directory in bytes
+	DiskThresholdPct int   // Stop logging if disk usage exceeds this percentage
+}
+
 // SessionLogger handles writing session logs to disk with rotation
 type SessionLogger struct {
-	logger         *zap.Logger
-	sessionsDir    string
-	activeFiles    map[string]*lumberjack.Logger
-	sessions       map[string]*types.Session
-	mutex          sync.RWMutex
-	rotationConfig RotationConfig
+	logger           *zap.Logger
+	sessionsDir      string
+	activeFiles      map[string]*lumberjack.Logger
+	sessions         map[string]*types.Session
+	mutex            sync.RWMutex
+	rotationConfig   RotationConfig
+	maxDirSizeBytes  int64 // Maximum total size of sessions directory
+	diskThresholdPct int   // Stop logging if disk usage exceeds this percentage
+	writeEnabled     bool  // Set to false if disk is full
 }
 
 // RotationConfig holds log rotation settings
@@ -42,18 +52,37 @@ func DefaultRotationConfig() RotationConfig {
 }
 
 // NewSessionLogger creates a new session logger
-func NewSessionLogger(logger *zap.Logger, sessionsDir string, config RotationConfig) (*SessionLogger, error) {
+func NewSessionLogger(logger *zap.Logger, sessionsDir string, config RotationConfig, diskConfig ...DiskManagementConfig) (*SessionLogger, error) {
 	// Ensure sessions directory exists
 	if err := os.MkdirAll(sessionsDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create sessions directory: %w", err)
 	}
 
+	// Use provided disk config or defaults
+	var diskMgmt DiskManagementConfig
+	if len(diskConfig) > 0 {
+		diskMgmt = diskConfig[0]
+	} else {
+		diskMgmt = DiskManagementConfig{
+			MaxDirSizeBytes:  10 * 1024 * 1024 * 1024, // 10GB default
+			DiskThresholdPct: 90,                      // Stop writing at 90% disk usage
+		}
+	}
+
 	sl := &SessionLogger{
-		logger:         logger,
-		sessionsDir:    sessionsDir,
-		activeFiles:    make(map[string]*lumberjack.Logger),
-		sessions:       make(map[string]*types.Session),
-		rotationConfig: config,
+		logger:           logger,
+		sessionsDir:      sessionsDir,
+		activeFiles:      make(map[string]*lumberjack.Logger),
+		sessions:         make(map[string]*types.Session),
+		rotationConfig:   config,
+		maxDirSizeBytes:  diskMgmt.MaxDirSizeBytes,
+		diskThresholdPct: diskMgmt.DiskThresholdPct,
+		writeEnabled:     true,
+	}
+
+	// Initial disk space check
+	if err := sl.CheckDiskSpace(); err != nil {
+		logger.Warn("Failed to check initial disk space", zap.Error(err))
 	}
 
 	return sl, nil
@@ -63,6 +92,11 @@ func NewSessionLogger(logger *zap.Logger, sessionsDir string, config RotationCon
 func (sl *SessionLogger) StartSession(event types.SSHEvent) error {
 	sl.mutex.Lock()
 	defer sl.mutex.Unlock()
+
+	// Check if writing is enabled (disk space check)
+	if !sl.writeEnabled {
+		return fmt.Errorf("session logging disabled due to disk space constraints")
+	}
 
 	// Create session object
 	session := &types.Session{
@@ -135,8 +169,14 @@ func (sl *SessionLogger) EndSession(sessionID string, logoutTime time.Time) erro
 			"file_event_count": len(session.FileEvents),
 		}
 
-		data, _ := json.Marshal(summary)
-		fmt.Fprintln(logWriter, string(data))
+		data, err := json.Marshal(summary)
+		if err != nil {
+			sl.logger.Error("Failed to marshal session summary", zap.Error(err))
+		} else {
+			if _, err := fmt.Fprintln(logWriter, string(data)); err != nil {
+				sl.logger.Error("Failed to write session summary", zap.Error(err))
+			}
+		}
 
 		// Close the log file
 		logWriter.Close()
@@ -157,6 +197,11 @@ func (sl *SessionLogger) LogCommand(sessionID string, cmd types.CommandEvent) er
 	sl.mutex.Lock()
 	defer sl.mutex.Unlock()
 
+	// Silently drop events if writing is disabled
+	if !sl.writeEnabled {
+		return nil
+	}
+
 	session, exists := sl.sessions[sessionID]
 	if !exists {
 		// Session might not be tracked, log to orphaned file
@@ -166,8 +211,15 @@ func (sl *SessionLogger) LogCommand(sessionID string, cmd types.CommandEvent) er
 	session.Commands = append(session.Commands, cmd)
 
 	if logWriter, exists := sl.activeFiles[sessionID]; exists {
-		data, _ := json.Marshal(cmd)
-		fmt.Fprintln(logWriter, string(data))
+		data, err := json.Marshal(cmd)
+		if err != nil {
+			sl.logger.Error("Failed to marshal command", zap.Error(err))
+			return err
+		}
+		if _, err := fmt.Fprintln(logWriter, string(data)); err != nil {
+			sl.logger.Error("Failed to write command", zap.Error(err))
+			return err
+		}
 	}
 
 	return nil
@@ -178,6 +230,11 @@ func (sl *SessionLogger) LogFileEvent(sessionID string, event types.FileEvent) e
 	sl.mutex.Lock()
 	defer sl.mutex.Unlock()
 
+	// Silently drop events if writing is disabled
+	if !sl.writeEnabled {
+		return nil
+	}
+
 	session, exists := sl.sessions[sessionID]
 	if !exists {
 		// Session might not be tracked, log to orphaned file
@@ -187,8 +244,15 @@ func (sl *SessionLogger) LogFileEvent(sessionID string, event types.FileEvent) e
 	session.FileEvents = append(session.FileEvents, event)
 
 	if logWriter, exists := sl.activeFiles[sessionID]; exists {
-		data, _ := json.Marshal(event)
-		fmt.Fprintln(logWriter, string(data))
+		data, err := json.Marshal(event)
+		if err != nil {
+			sl.logger.Error("Failed to marshal file event", zap.Error(err))
+			return err
+		}
+		if _, err := fmt.Fprintln(logWriter, string(data)); err != nil {
+			sl.logger.Error("Failed to write file event", zap.Error(err))
+			return err
+		}
 	}
 
 	return nil
@@ -219,24 +283,41 @@ func (sl *SessionLogger) writeSessionHeader(writer *lumberjack.Logger, session *
 
 // logOrphanedEvent logs events that can't be associated with a known session
 func (sl *SessionLogger) logOrphanedEvent(eventType string, event interface{}) error {
+	sl.mutex.Lock()
+	defer sl.mutex.Unlock()
+
+	// Reuse orphaned events logger if already created
 	orphanedLog := filepath.Join(sl.sessionsDir, "orphaned_events.log")
+	var orphanedWriter *lumberjack.Logger
 
-	lumberjackLogger := &lumberjack.Logger{
-		Filename:   orphanedLog,
-		MaxSize:    sl.rotationConfig.MaxSize,
-		MaxBackups: sl.rotationConfig.MaxBackups,
-		MaxAge:     sl.rotationConfig.MaxAge,
-		Compress:   sl.rotationConfig.Compress,
+	// Check if we already have an orphaned events writer
+	if writer, exists := sl.activeFiles["__orphaned__"]; exists {
+		orphanedWriter = writer
+	} else {
+		orphanedWriter = &lumberjack.Logger{
+			Filename:   orphanedLog,
+			MaxSize:    sl.rotationConfig.MaxSize,
+			MaxBackups: sl.rotationConfig.MaxBackups,
+			MaxAge:     sl.rotationConfig.MaxAge,
+			Compress:   sl.rotationConfig.Compress,
+		}
+		sl.activeFiles["__orphaned__"] = orphanedWriter
 	}
-	defer lumberjackLogger.Close()
 
-	data, _ := json.Marshal(map[string]interface{}{
+	data, err := json.Marshal(map[string]interface{}{
 		"event_type": eventType,
 		"data":       event,
 		"logged_at":  time.Now(),
 	})
+	if err != nil {
+		sl.logger.Error("Failed to marshal orphaned event", zap.Error(err))
+		return err
+	}
 
-	_, err := fmt.Fprintln(lumberjackLogger, string(data))
+	_, err = fmt.Fprintln(orphanedWriter, string(data))
+	if err != nil {
+		sl.logger.Error("Failed to write orphaned event", zap.Error(err))
+	}
 	return err
 }
 
@@ -268,8 +349,12 @@ func (sl *SessionLogger) Close() {
 	defer sl.mutex.Unlock()
 
 	for sessionID, logWriter := range sl.activeFiles {
+		if sessionID == "__orphaned__" {
+			sl.logger.Info("Closed orphaned events log")
+		} else {
+			sl.logger.Info("Closed session log", zap.String("session_id", sessionID))
+		}
 		logWriter.Close()
-		sl.logger.Info("Closed session log", zap.String("session_id", sessionID))
 	}
 	sl.activeFiles = make(map[string]*lumberjack.Logger)
 }
@@ -291,8 +376,14 @@ func (sl *SessionLogger) CleanupOldSessions(maxDuration time.Duration) {
 					"reason":       "max_duration_exceeded",
 					"max_duration": maxDuration.String(),
 				}
-				data, _ := json.Marshal(summary)
-				fmt.Fprintln(logWriter, string(data))
+				data, err := json.Marshal(summary)
+				if err != nil {
+					sl.logger.Error("Failed to marshal timeout summary", zap.Error(err))
+				} else {
+					if _, err := fmt.Fprintln(logWriter, string(data)); err != nil {
+						sl.logger.Error("Failed to write timeout summary", zap.Error(err))
+					}
+				}
 				logWriter.Close()
 				delete(sl.activeFiles, sessionID)
 			}
@@ -302,4 +393,117 @@ func (sl *SessionLogger) CleanupOldSessions(maxDuration time.Duration) {
 				zap.Duration("duration", now.Sub(session.LoginTime)))
 		}
 	}
+}
+
+// CheckDiskSpace checks available disk space and disables writing if threshold exceeded
+func (sl *SessionLogger) CheckDiskSpace() error {
+	sl.mutex.Lock()
+	defer sl.mutex.Unlock()
+
+	// Get disk usage for the sessions directory
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(sl.sessionsDir, &stat); err != nil {
+		return fmt.Errorf("failed to stat sessions directory: %w", err)
+	}
+
+	// Calculate disk usage percentage
+	total := stat.Blocks * uint64(stat.Bsize)
+	available := stat.Bavail * uint64(stat.Bsize)
+	used := total - available
+	usagePct := int((float64(used) / float64(total)) * 100)
+
+	// Check if we've exceeded the threshold
+	if sl.diskThresholdPct > 0 && usagePct >= sl.diskThresholdPct {
+		if sl.writeEnabled {
+			sl.logger.Error("Disk space threshold exceeded, disabling session logging",
+				zap.Int("usage_percent", usagePct),
+				zap.Int("threshold_percent", sl.diskThresholdPct),
+				zap.String("sessions_dir", sl.sessionsDir))
+			sl.writeEnabled = false
+		}
+	} else {
+		// Re-enable if we're back under threshold (with 5% hysteresis)
+		if !sl.writeEnabled && usagePct < (sl.diskThresholdPct-5) {
+			sl.logger.Info("Disk space recovered, re-enabling session logging",
+				zap.Int("usage_percent", usagePct))
+			sl.writeEnabled = true
+		}
+	}
+
+	return nil
+}
+
+// CleanupOldDirectories removes session directories older than retention days
+func (sl *SessionLogger) CleanupOldDirectories(retentionDays int) error {
+	if retentionDays <= 0 {
+		return nil
+	}
+
+	entries, err := os.ReadDir(sl.sessionsDir)
+	if err != nil {
+		return fmt.Errorf("failed to read sessions directory: %w", err)
+	}
+
+	cutoff := time.Now().AddDate(0, 0, -retentionDays)
+	deleted := 0
+	freedBytes := int64(0)
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		// Parse directory name as date (YYYY-MM-DD format)
+		dirDate, err := time.Parse("2006-01-02", entry.Name())
+		if err != nil {
+			continue // Skip non-date directories
+		}
+
+		if dirDate.Before(cutoff) {
+			dirPath := filepath.Join(sl.sessionsDir, entry.Name())
+			size := sl.getDirSize(dirPath)
+
+			if err := os.RemoveAll(dirPath); err != nil {
+				sl.logger.Warn("Failed to remove old session directory",
+					zap.String("path", dirPath),
+					zap.Error(err))
+			} else {
+				deleted++
+				freedBytes += size
+				sl.logger.Info("Removed old session directory",
+					zap.String("path", dirPath),
+					zap.Int64("freed_bytes", size))
+			}
+		}
+	}
+
+	sl.logger.Info("Directory cleanup completed",
+		zap.Int("directories_removed", deleted),
+		zap.Int64("total_freed_bytes", freedBytes))
+
+	return nil
+}
+
+// getDirSize calculates the total size of a directory
+func (sl *SessionLogger) getDirSize(path string) int64 {
+	var size int64
+	filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			size += info.Size()
+		}
+		return nil
+	})
+	return size
+}
+
+// GetDirectorySize returns the total size of the sessions directory
+func (sl *SessionLogger) GetDirectorySize() int64 {
+	return sl.getDirSize(sl.sessionsDir)
+}
+
+// IsWriteEnabled returns true if writing is currently enabled
+func (sl *SessionLogger) IsWriteEnabled() bool {
+	sl.mutex.RLock()
+	defer sl.mutex.RUnlock()
+	return sl.writeEnabled
 }

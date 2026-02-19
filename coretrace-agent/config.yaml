@@ -68,6 +68,8 @@ session_logging:
   max_session_duration: "24h"
   # How often to check for stale sessions
   cleanup_interval: "1h"
+  # Number of days to retain session directories (daily cleanup)
+  retention_days: 30
   
   # Log rotation settings
   rotation:
@@ -91,3 +93,14 @@ performance:
   max_cpu_percent: 50
   max_memory_mb: 512
   gc_percent: 100
+
+# Disk management settings
+disk_management:
+  # Maximum disk usage percentage before disabling writes (0-100)
+  # When disk usage exceeds this threshold, session logging is paused
+  # Logging resumes when disk usage drops 5% below threshold
+  usage_threshold_percent: 90
+  
+  # Maximum total size of sessions directory in GB
+  # When exceeded, oldest session directories are removed first
+  max_sessions_size_gb: 10

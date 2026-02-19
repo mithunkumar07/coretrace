@@ -103,18 +103,6 @@ func (cm *auditdMonitor) monitorAuditLog(ctx context.Context) {
 		}
 	}
 
-	file, err := os.Open(auditLogFile)
-	if err != nil {
-		cm.logger.Error("Failed to open audit log", zap.String("file", auditLogFile), zap.Error(err))
-		return
-	}
-	defer file.Close()
-
-	reader := bufio.NewReader(file)
-	file.Seek(0, 2)
-
-	pendingCommands := make(map[string]*PendingCommand)
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -122,10 +110,45 @@ func (cm *auditdMonitor) monitorAuditLog(ctx context.Context) {
 		case <-cm.stopChan:
 			return
 		default:
+			if err := cm.tailAuditLog(ctx, auditLogFile); err != nil {
+				cm.logger.Error("Error tailing audit log", zap.Error(err))
+				time.Sleep(5 * time.Second)
+			}
+		}
+	}
+}
+
+func (cm *auditdMonitor) tailAuditLog(ctx context.Context, auditLogFile string) error {
+	file, err := os.Open(auditLogFile)
+	if err != nil {
+		return fmt.Errorf("failed to open audit log: %w", err)
+	}
+	defer file.Close()
+
+	reader := bufio.NewReader(file)
+	file.Seek(0, 2)
+
+	pendingCommands := make(map[string]*PendingCommand)
+	cleanupTicker := time.NewTicker(30 * time.Second)
+	defer cleanupTicker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-cm.stopChan:
+			return nil
+		case <-cleanupTicker.C:
+			cm.cleanupPendingCommands(pendingCommands)
+		default:
 			line, err := reader.ReadString('\n')
 			if err != nil {
+				// Check if file was rotated
+				if os.IsNotExist(err) {
+					cm.logger.Info("Audit log rotated, reopening")
+					return nil
+				}
 				time.Sleep(100 * time.Millisecond)
-				cm.cleanupPendingCommands(pendingCommands)
 				continue
 			}
 

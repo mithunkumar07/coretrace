@@ -262,7 +262,25 @@ else
 fi
 echo ""
 
-# Step 5: Create systemd service
+# Step 5: Create logrotate configuration
+log_step "Creating logrotate configuration..."
+
+cat > /etc/logrotate.d/coretrace << EOF
+$LOG_DIR/sessions/**/*.jsonl {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 root root
+}
+EOF
+
+log_info "Logrotate configuration created"
+echo ""
+
+# Step 6: Create systemd service
 log_step "Creating systemd service..."
 
 cat > /etc/systemd/system/coretrace-agent.service << EOF
@@ -304,7 +322,7 @@ else
 fi
 echo ""
 
-# Step 6: Start the service
+# Step 7: Start the service
 log_step "Starting CoreTrace Agent..."
 
 if command -v systemctl &> /dev/null; then

@@ -52,25 +52,41 @@ func (sm *SSHMonitor) monitorAuthLog(ctx context.Context) {
 		authLogFile = "/var/log/secure"
 	}
 
-	file, err := os.Open(authLogFile)
-	if err != nil {
-		sm.logger.Error("Failed to open auth log", zap.String("file", authLogFile), zap.Error(err))
-		return
-	}
-	defer file.Close()
-
-	reader := bufio.NewReader(file)
-
-	// Seek to end of file for real-time monitoring
-	file.Seek(0, 2)
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
+			if err := sm.tailAuthLog(ctx, authLogFile); err != nil {
+				sm.logger.Error("Error tailing auth log", zap.Error(err))
+				time.Sleep(5 * time.Second)
+			}
+		}
+	}
+}
+
+func (sm *SSHMonitor) tailAuthLog(ctx context.Context, authLogFile string) error {
+	file, err := os.Open(authLogFile)
+	if err != nil {
+		return fmt.Errorf("failed to open auth log: %w", err)
+	}
+	defer file.Close()
+
+	reader := bufio.NewReader(file)
+	file.Seek(0, 2)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
 			line, err := reader.ReadString('\n')
 			if err != nil {
+				// Check if file was rotated
+				if os.IsNotExist(err) {
+					sm.logger.Info("Auth log rotated, reopening")
+					return nil
+				}
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
@@ -96,11 +112,7 @@ func (sm *SSHMonitor) parseAuthLine(line string) {
 }
 
 func (sm *SSHMonitor) handleSSHLogin(matches []string, success bool) {
-	timestamp, err := time.Parse("Jan 2 15:04:05", fmt.Sprintf("%s %s", matches[1], time.Now().Format("2006")))
-	if err != nil {
-		sm.logger.Warn("Failed to parse timestamp", zap.Error(err))
-		timestamp = time.Now()
-	}
+	timestamp := sm.parseSyslogTimestamp(matches[1])
 
 	// matches: [0]=full, [1]=timestamp, [2]=pid, [3]=authMethod, [4]=username, [5]=sourceIP, [6]=port, [7]=keyInfo
 	pid := 0
@@ -145,12 +157,28 @@ func (sm *SSHMonitor) handleSSHLogin(matches []string, success bool) {
 	}
 }
 
-func (sm *SSHMonitor) handleSSHLogout(matches []string) {
-	timestamp, err := time.Parse("Jan 2 15:04:05", fmt.Sprintf("%s %s", matches[1], time.Now().Format("2006")))
+func (sm *SSHMonitor) parseSyslogTimestamp(timeStr string) time.Time {
+	now := time.Now()
+	// Try current year first
+	timestamp, err := time.Parse("Jan 2 15:04:05", fmt.Sprintf("%s %d", timeStr, now.Year()))
 	if err != nil {
 		sm.logger.Warn("Failed to parse timestamp", zap.Error(err))
-		timestamp = time.Now()
+		return now
 	}
+
+	// If timestamp is in the future by more than 24 hours, assume it's from last year
+	if timestamp.After(now.Add(24 * time.Hour)) {
+		timestamp, err = time.Parse("Jan 2 15:04:05", fmt.Sprintf("%s %d", timeStr, now.Year()-1))
+		if err != nil {
+			return now
+		}
+	}
+
+	return timestamp
+}
+
+func (sm *SSHMonitor) handleSSHLogout(matches []string) {
+	timestamp := sm.parseSyslogTimestamp(matches[1])
 
 	// matches: [0]=full, [1]=timestamp, [2]=pid, [3]=username
 	pid := 0
@@ -178,11 +206,7 @@ func (sm *SSHMonitor) handleSSHLogout(matches []string) {
 }
 
 func (sm *SSHMonitor) handleSSHAuthFailed(matches []string) {
-	timestamp, err := time.Parse("Jan 2 15:04:05", fmt.Sprintf("%s %s", matches[1], time.Now().Format("2006")))
-	if err != nil {
-		sm.logger.Warn("Failed to parse timestamp", zap.Error(err))
-		timestamp = time.Now()
-	}
+	timestamp := sm.parseSyslogTimestamp(matches[1])
 
 	// matches: [0]=full, [1]=timestamp, [2]=username, [3]=sourceIP, [4]=port
 	username := matches[2]

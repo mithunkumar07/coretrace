@@ -75,7 +75,19 @@ func startMonitoring() {
 		rotationConfig.MaxAge = 30
 	}
 
-	sessionLogger, err := logger.NewSessionLogger(zapLogger, sessionsDir, rotationConfig)
+	// Get disk management configuration
+	diskConfig := logger.DiskManagementConfig{
+		MaxDirSizeBytes:  int64(viper.GetInt("disk_management.max_sessions_size_gb")) * 1024 * 1024 * 1024,
+		DiskThresholdPct: viper.GetInt("disk_management.usage_threshold_percent"),
+	}
+	if diskConfig.MaxDirSizeBytes == 0 {
+		diskConfig.MaxDirSizeBytes = 10 * 1024 * 1024 * 1024 // 10GB default
+	}
+	if diskConfig.DiskThresholdPct == 0 {
+		diskConfig.DiskThresholdPct = 90 // 90% default
+	}
+
+	sessionLogger, err := logger.NewSessionLogger(zapLogger, sessionsDir, rotationConfig, diskConfig)
 	if err != nil {
 		zapLogger.Fatal("Failed to create session logger", zap.Error(err))
 	}
@@ -138,6 +150,11 @@ func startMonitoring() {
 	// Stop file monitor
 	if err := fileMonitor.Stop(); err != nil {
 		zapLogger.Error("Error stopping file monitor", zap.Error(err))
+	}
+
+	// Stop command monitor
+	if err := cmdMonitor.Stop(); err != nil {
+		zapLogger.Error("Error stopping command monitor", zap.Error(err))
 	}
 
 	zapLogger.Info("CoreTrace agent stopped")
@@ -254,6 +271,14 @@ func sessionCleanupRoutine(ctx context.Context, zapLogger *zap.Logger, sessionLo
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	// Disk space check ticker (every 5 minutes)
+	diskCheckTicker := time.NewTicker(5 * time.Minute)
+	defer diskCheckTicker.Stop()
+
+	// Directory cleanup ticker (daily)
+	dirCleanupTicker := time.NewTicker(24 * time.Hour)
+	defer dirCleanupTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -261,7 +286,24 @@ func sessionCleanupRoutine(ctx context.Context, zapLogger *zap.Logger, sessionLo
 		case <-ticker.C:
 			sessionLogger.CleanupOldSessions(maxDuration)
 			activeSessions := sessionLogger.GetActiveSessions()
-			zapLogger.Info("Session cleanup completed", zap.Int("active_sessions", len(activeSessions)))
+			dirSize := sessionLogger.GetDirectorySize()
+			zapLogger.Info("Session cleanup completed",
+				zap.Int("active_sessions", len(activeSessions)),
+				zap.Int64("sessions_dir_size_bytes", dirSize),
+				zap.Bool("write_enabled", sessionLogger.IsWriteEnabled()))
+		case <-diskCheckTicker.C:
+			if err := sessionLogger.CheckDiskSpace(); err != nil {
+				zapLogger.Error("Failed to check disk space", zap.Error(err))
+			}
+		case <-dirCleanupTicker.C:
+			// Clean up session directories older than retention period
+			retentionDays := viper.GetInt("session_logging.retention_days")
+			if retentionDays == 0 {
+				retentionDays = 30 // Default 30 days
+			}
+			if err := sessionLogger.CleanupOldDirectories(retentionDays); err != nil {
+				zapLogger.Error("Failed to cleanup old directories", zap.Error(err))
+			}
 		}
 	}
 }
