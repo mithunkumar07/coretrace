@@ -1,265 +1,315 @@
-# CoreTrace SSH Session Monitoring Agent
+# CoreTrace Agent
 
-A lightweight Go agent for monitoring SSH sessions, login attempts, command execution, and file activities in real-time.
+A lightweight Go agent for Infrastructure Runtime Intelligence on Linux servers.
 
-## Features
+The agent is the **data plane component** that runs on each monitored host. It captures runtime events — SSH sessions, command execution, file changes — correlates them into sessions, and streams them to the CoreTrace dashboard.
 
-- **SSH Session Monitoring**: Detect successful/failed SSH logins with source IP and geolocation
-- **Command Logging**: Track commands executed within SSH sessions
-- **File Activity Monitoring**: Monitor file access, creation, modification, and deletion
-- **Session Correlation**: Correlate all events to specific SSH sessions
-- **Key Fingerprinting**: Identify SSH keys used for authentication
-- **Real-time Processing**: Event-driven architecture with low overhead
+---
+
+## What it monitors
+
+| Module | What it captures | How |
+|---|---|---|
+| **SSH** | Login/logout/failed attempts, username, source IP, auth method, key fingerprint | Tails `/var/log/auth.log` |
+| **File Integrity** | Create, modify, delete, chmod on watched paths | fsnotify (kernel inotify) |
+| **Commands** | Every command executed during an SSH session — binary, args, working directory, PID | auditd (MVP) → eBPF (Phase 2) |
+
+All three modules run independently. A failure in one does not affect the others.
+
+---
 
 ## Architecture
 
 ```
-├── main.go                 # Entry point
-├── cmd/
-│   ├── root.go            # CLI root command
-│   └── monitor.go         # Monitor command implementation
-├── internal/
-│   ├── types/
-│   │   └── events.go      # Event type definitions
-│   ├── monitor/
-│   │   ├── ssh.go         # SSH log monitoring
-│   │   ├── file.go        # File system monitoring
-│   │   ├── command.go     # Command monitoring interface
-│   │   └── command_auditd.go  # Auditd backend
-│   └── logger/
-│       └── session.go     # Session logging with rotation
-├── config.yaml            # Configuration file
-├── setup-auditd.sh        # One-time auditd setup
-└── coretrace-agent        # Compiled binary
+┌─────────────────────────────────────────────────────┐
+│                  coretrace-agent                    │
+│                                                     │
+│  ┌─────────────┐  ┌──────────────┐  ┌───────────┐  │
+│  │ SSH Monitor │  │ File Monitor │  │  Command  │  │
+│  │  (ssh.go)  │  │  (file.go)   │  │  Monitor  │  │
+│  └──────┬──────┘  └──────┬───────┘  └─────┬─────┘  │
+│         │                │                │         │
+│         └────────────────┴────────────────┘         │
+│                          │                          │
+│                  Session Correlator                 │
+│               (PID tree walk → session_id)          │
+│                          │                          │
+│            ┌─────────────┴──────────────┐           │
+│            │                            │           │
+│     Session Logger                Dashboard Client  │
+│  (/var/log/coretrace/sessions/)    (WebSocket)      │
+└─────────────────────────────────────────────────────┘
 ```
 
-## Usage
+**Session correlation:** When an SSH login is detected, the sshd PID is recorded. File and command monitors walk the `/proc` PID tree to find the parent sshd process and tag events with the matching `session_id`. Events with no matching session go to `orphaned_events.log`.
 
-### Build
+---
+
+## Project Structure
+
+```
+coretrace-agent/
+├── main.go                           # Entry point
+├── cmd/
+│   ├── root.go                       # CLI root (cobra)
+│   └── monitor.go                    # `monitor` command — orchestrates all modules
+├── internal/
+│   ├── types/
+│   │   └── events.go                 # SSHEvent, CommandEvent, FileEvent structs
+│   ├── monitor/
+│   │   ├── ssh.go                    # Auth log parser (regex), session tracking
+│   │   ├── file.go                   # fsnotify watcher for configured paths
+│   │   ├── command.go                # CommandMonitor interface
+│   │   └── command_auditd.go         # Auditd log parser implementation
+│   ├── logger/
+│   │   └── session.go                # Per-session JSONL files + lumberjack rotation
+│   └── dashboard/
+│       └── client.go                 # WebSocket client, reconnect, event batching
+├── config.yaml                       # Full configuration reference
+├── setup-auditd.sh                   # One-time auditd setup script
+└── deploy/
+    ├── coretrace.service             # Systemd unit file
+    ├── Dockerfile
+    └── docker-compose.yml
+```
+
+---
+
+## Build
+
+Requires Go 1.21+. No CGO — produces a single static binary.
+
 ```bash
+cd coretrace-agent
 go build -o coretrace-agent .
 ```
 
-### Run Monitor
+**Cross-compile for Linux:**
 ```bash
+# AMD64
+GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o coretrace-agent-linux-amd64 .
+
+# ARM64 (Raspberry Pi, Graviton)
+GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o coretrace-agent-linux-arm64 .
+```
+
+Binary size is ~15MB unstripped, ~10MB stripped (`-ldflags="-s -w"`).
+
+---
+
+## Run
+
+The agent requires **root** to read system logs and monitor file system events.
+
+```bash
+# Basic run
 sudo ./coretrace-agent monitor
-```
 
-### Run with Debug
-```bash
+# With debug logging
 sudo ./coretrace-agent monitor --debug
+
+# Custom config path
+sudo ./coretrace-agent monitor --config /etc/coretrace/config.yaml
 ```
 
-### Use Custom Config
-```bash
-sudo ./coretrace-agent monitor --config /path/to/config.yaml
-```
-
-## Monitoring Capabilities
-
-### SSH Events
-- Successful SSH logins (username, IP, auth method, key fingerprint)
-- Failed SSH login attempts
-- SSH logout events
-- Real-time geolocation lookup
-
-### File Events
-- File creation, modification, deletion
-- Permission changes
-- Directory monitoring with recursive watch
-- Configurable include/exclude patterns
-
-### Session Correlation
-- All events linked to specific SSH sessions
-- PID-based process tracking
-- User attribution for file operations
+---
 
 ## Configuration
 
-Edit `config.yaml` to customize:
-- Log paths for SSH monitoring
-- File paths to watch
-- Event buffer sizes
-- Geolocation settings
-- Performance limits
+The full reference is in `config.yaml`. Key sections:
 
-## Requirements
+```yaml
+# SSH monitoring
+ssh:
+  auth_log: /var/log/auth.log         # Path to auth log (Ubuntu/Debian)
+  # auth_log: /var/log/secure         # RHEL/CentOS
+  session_timeout: 3600               # Seconds before inactive session is closed
+  max_sessions: 1000                  # Max tracked sessions in memory
 
-- Linux system
-- Root privileges (for log access and file monitoring)
-- Go 1.21+ (for building)
+# File integrity monitoring
+file_monitoring:
+  watch_paths:
+    - /etc
+    - /home
+    - /root
+    - /var/log
+    - /opt
+    - /tmp
+  exclude_patterns:
+    - "*.swp"
+    - ".git/*"
 
-## Output Format
+# Command monitoring
+command_monitoring:
+  backend: auditd                     # auditd | ebpf (Phase 2) | disabled
+  auditd_log: /var/log/audit/audit.log
 
-Events are logged in structured JSON format:
-```json
-{
-  "timestamp": "2024-01-15T10:30:45Z",
-  "event_type": "ssh_login",
-  "session_id": "192.168.1.100_admin_1705316245",
-  "username": "admin",
-  "source_ip": "192.168.1.100",
-  "location": {
-    "country": "Unknown",
-    "city": "Unknown"
-  },
-  "auth_method": "publickey",
-  "success": true
-}
+# Session log rotation
+session_logging:
+  base_path: /var/log/coretrace/sessions
+  rotation:
+    max_size_mb: 100
+    max_backups: 10
+    max_age_days: 30
+    compress: true
+
+# Dashboard connection
+dashboard:
+  url: ws://localhost:8080
+  api_key: ""                         # Set after registering agent in dashboard
+  reconnect_interval: 5s
 ```
+
+---
 
 ## Session Logs
 
-Each SSH session gets its own log file with rotation support:
+Each SSH session gets its own JSONL log file, organised by date:
 
 ```
 /var/log/coretrace/sessions/
-├── 2024-01-15/
-│   ├── 192.168.1.100_admin_1705316245.jsonl
-│   └── 192.168.1.101_root_1705316300.jsonl
-└── orphaned_events.log
+├── 2025-03-20/
+│   ├── 192.168.1.100_admin_1742428800.jsonl
+│   ├── 10.0.0.5_deploy_1742428850.jsonl
+│   └── ...
+└── orphaned_events.log               # Events with no matching session
 ```
 
-Session logs contain:
-- SSH login/logout events with key fingerprints
-- **All commands executed during the session** (requires auditd setup)
-- File operations performed
-- Session duration and activity summary
+Each file contains the full session timeline in order:
 
-### Log Rotation
-
-Configure rotation in `config.yaml`:
-```yaml
-session_logging:
-  rotation:
-    max_size_mb: 100      # Rotate at 100MB
-    max_backups: 10       # Keep 10 backups
-    max_age_days: 30      # Delete after 30 days
-    compress: true        # Gzip old files
+```jsonl
+{"event_type":"session_start","timestamp":"2025-03-20T10:00:00Z","session_id":"192.168.1.100_admin_1742428800","username":"admin","source_ip":"192.168.1.100","auth_method":"publickey","key_fingerprint":"SHA256:abc123...","pid":1234}
+{"event_type":"command","timestamp":"2025-03-20T10:00:05Z","session_id":"192.168.1.100_admin_1742428800","command":"cat","args":["cat","/etc/passwd"],"working_dir":"/home/admin","pid":5678,"ppid":1234}
+{"event_type":"file_change","timestamp":"2025-03-20T10:00:12Z","session_id":"192.168.1.100_admin_1742428800","file_path":"/etc/nginx/nginx.conf","operation":"write"}
+{"event_type":"session_end","timestamp":"2025-03-20T10:14:35Z","session_id":"192.168.1.100_admin_1742428800","duration_sec":875,"command_count":18,"file_event_count":3}
 ```
+
+---
 
 ## Command Monitoring Setup
 
-**Important:** The agent works without any setup for SSH and file monitoring. Command logging requires one-time auditd configuration, which can be automated.
+SSH and file monitoring work with no setup. Command logging requires auditd.
 
-### Automated Setup (Recommended)
-
-Run the included setup script that handles everything:
+### Automated (recommended)
 
 ```bash
 sudo ./setup-auditd.sh
 ```
 
-This script:
-- Installs auditd if not present
-- Configures execve monitoring rules
-- Makes rules persistent across reboots
-- Starts the auditd service
+This installs auditd if needed, adds persistent execve monitoring rules, and starts the service.
 
-### What if I can't use auditd?
-
-The agent gracefully handles missing auditd:
-- ✅ SSH login/logout tracking works
-- ✅ File change monitoring works
-- ✅ Session logs are created
-- ⚠️ Command logging is disabled (shown in logs)
-
-**For SaaS deployments:** The setup script can be integrated into your deployment automation (Ansible, Puppet, Chef, cloud-init, etc.).
-
-### Manual Setup (if needed)
-
-If you prefer manual configuration:
+### Manual
 
 ```bash
-# 1. Install auditd
-sudo apt-get install -y auditd  # Debian/Ubuntu
-sudo yum install -y audit        # RHEL/CentOS
+# Install auditd
+sudo apt-get install -y auditd          # Debian/Ubuntu
+sudo yum install -y audit               # RHEL/CentOS
 
-# 2. Add monitoring rules
-sudo auditctl -a always,exit -F arch=b64 -S execve -S execveat -k session_monitoring
-sudo auditctl -a always,exit -F arch=b32 -S execve -S execveat -k session_monitoring
+# Add rules
+sudo auditctl -a always,exit -F arch=b64 -S execve -S execveat -k coretrace
+sudo auditctl -a always,exit -F arch=b32 -S execve -S execveat -k coretrace
 
-# 3. Make persistent
-sudo tee /etc/audit/rules.d/coretrace.rules << EOF
--a always,exit -F arch=b64 -S execve -S execveat -k session_monitoring
--a always,exit -F arch=b32 -S execve -S execveat -k session_monitoring
-EOF
+# Make persistent
+echo "-a always,exit -F arch=b64 -S execve -S execveat -k coretrace" | \
+  sudo tee /etc/audit/rules.d/coretrace.rules
 sudo augenrules --load
 ```
 
-## Session Log Example
+### Without auditd
 
-```json
-{"event_type":"session_start","timestamp":"2024-01-15T10:30:45Z","session_id":"192.168.1.100_admin_1705316245","username":"admin","source_ip":"192.168.1.100","auth_method":"publickey","key_fingerprint":"SHA256:abc123def456...","pid":1234}
-{"timestamp":"2024-01-15T10:30:50Z","event_type":"command","session_id":"192.168.1.100_admin_1705316245","username":"admin","command":"ls","args":["ls","-la","/etc"],"working_dir":"/home/admin","pid":5678,"ppid":1234}
-{"timestamp":"2024-01-15T10:31:05Z","event_type":"file_change","session_id":"192.168.1.100_admin_1705316245","username":"admin","file_path":"/etc/nginx/nginx.conf","operation":"write"}
-{"event_type":"session_end","timestamp":"2024-01-15T10:45:30Z","session_id":"192.168.1.100_admin_1705316245","duration_sec":885,"command_count":15,"file_event_count":3}
+The agent degrades gracefully:
+
+| Capability | Without auditd |
+|---|---|
+| SSH login/logout tracking | ✅ Works |
+| File integrity monitoring | ✅ Works |
+| Session logs created | ✅ Works |
+| Command logging | ❌ Disabled (logged at startup) |
+
+---
+
+## Production Deployment
+
+### Systemd service
+
+```bash
+sudo cp coretrace-agent /usr/local/bin/
+sudo cp deploy/coretrace.service /etc/systemd/system/
+sudo mkdir -p /etc/coretrace
+sudo cp config.yaml /etc/coretrace/config.yaml
+sudo systemctl enable coretrace
+sudo systemctl start coretrace
+sudo journalctl -u coretrace -f
 ```
+
+### Docker
+
+```bash
+docker run --privileged \
+  -v /var/log:/var/log:ro \
+  -v /etc:/etc:ro \
+  -v /var/log/coretrace:/var/log/coretrace \
+  coretrace/agent:latest
+```
+
+---
 
 ## Troubleshooting
 
-### Commands not appearing in session logs
-
-1. Check if auditd is running:
+**Commands not appearing in logs**
 ```bash
 sudo systemctl status auditd
-sudo auditctl -l | grep session_monitoring
+sudo auditctl -l | grep coretrace
+sudo tail -f /var/log/audit/audit.log
 ```
 
-2. Verify audit log is being written:
-```bash
-sudo tail -f /var/log/audit/audit.log | grep session_monitoring
-```
+**Agent not detecting SSH logins**
+- Check the auth log path in `config.yaml` (`/var/log/auth.log` on Ubuntu, `/var/log/secure` on RHEL)
+- Confirm the agent is running as root
+- Run with `--debug` and SSH in from another terminal
 
-3. Run agent with debug mode to see parsing details:
-```bash
-sudo ./coretrace-agent monitor --debug
-```
+**High disk usage**
+- Tune `session_logging.rotation.max_age_days` and `max_backups` in `config.yaml`
+- The agent logs disk usage warnings when thresholds are exceeded
 
-### Permission denied errors
+---
 
-The agent requires root to:
-- Read `/var/log/auth.log` or `/var/log/secure`
-- Read `/var/log/audit/audit.log`
-- Monitor file system events
-- Access process information in `/proc`
+## Roadmap
 
-## Product Roadmap
+### Phase 1 — MVP ✅
+- SSH session monitoring
+- File integrity monitoring
+- Auditd-based command logging
+- Session-based JSONL logging with rotation
+- WebSocket client for dashboard integration
 
-### Phase 1: MVP (Current)
-- ✅ SSH session monitoring
-- ✅ File integrity monitoring  
-- ✅ Session-based logging with rotation
-- ✅ Auditd-based command logging
+### Phase 2 — Zero-Dependency (next)
+- **eBPF command monitoring** — replaces auditd, zero customer setup, works on kernel 4.18+
+- Fallback chain: eBPF → auditd → disabled
+- **Runtime process visibility** — `execve`, privilege escalation, setuid tracking
+- **Container awareness** — cgroup detection, container ID tagging
 
-### Phase 2: Zero-Dependency Command Monitoring
-**Goal:** Remove auditd requirement using eBPF
+### Phase 3 — SaaS Integration
+- Collector protocol — forward aggregated events to CoreTrace cloud
+- Policy management via control plane API
+- Compliance evidence packaging (SOC2, ISO27001)
 
-- **eBPF-based execve tracing** - No external dependencies, works on modern kernels (4.18+)
-- **Graceful fallback** - eBPF → auditd → disabled
-- **Self-contained binary** - eBPF bytecode embedded in agent
+### Phase 4 — Intelligence
+- Behavioural baselines — learn what normal looks like per user/server
+- Anomaly scoring — deviation from baseline triggers risk elevation
+- Risk scores at session, user, server, and cluster levels
+- Alerting integrations — Slack, PagerDuty, webhook, SIEM
 
-**Why eBPF?**
-- Zero customer setup required
-- Better performance than auditd parsing
-- Modern standard (Cilium, Pixie, Falco use it)
-- Safe and kernel-verified
+---
 
-### Phase 3: SaaS Integration
-- **Collector protocol** - Send events to CoreTrace cloud
-- **Control plane API** - Policy management from SaaS
-- **Compliance dashboards** - SOC2/ISO27001 evidence exports
+## Dependencies
 
-### Phase 4: Intelligence
-- **Behavioral baselines** - Learn normal vs. anomalous activity
-- **Risk scoring** - Per-session, per-user, per-server risk metrics
-- **Integration ecosystem** - Slack, PagerDuty, SIEM webhooks
-
-## Current Limitations & Workarounds
-
-| Feature | Current | Future |
-|---------|---------|--------|
-| Command logging | Requires auditd setup | eBPF (no setup) |
-| Kernel support | All Linux | 4.18+ for eBPF |
-| Architecture | AMD64 | ARM64 support |
-| Container-aware | Host only | Container + K8s |
+| Library | Purpose |
+|---|---|
+| `github.com/fsnotify/fsnotify` | File system monitoring via inotify |
+| `github.com/spf13/cobra` | CLI framework |
+| `github.com/spf13/viper` | Configuration management |
+| `go.uber.org/zap` | Structured logging |
+| `gopkg.in/natefinch/lumberjack.v2` | Log rotation |
+| `github.com/cilium/ebpf` | eBPF (Phase 2 — imported, not yet wired) |
+| `github.com/gorilla/websocket` | Dashboard WebSocket client |

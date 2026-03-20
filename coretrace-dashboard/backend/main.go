@@ -33,6 +33,9 @@ func main() {
 		log.Fatalf("Failed to run migrations: %v", err)
 	}
 
+	// Seed default admin user
+	database.SeedAdmin(db)
+
 	// Initialize WebSocket hub
 	hub := websocket.NewHub()
 	go hub.Run()
@@ -47,6 +50,7 @@ func main() {
 
 	// Setup API routes
 	api.SetupRoutes(router, db, hub)
+	api.SetupAuthRoutes(router, db, cfg.JWTSecret)
 
 	// Setup WebSocket route
 	router.GET("/ws/agents", func(c *gin.Context) {

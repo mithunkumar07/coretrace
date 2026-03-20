@@ -1,35 +1,43 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from '/vite.svg'
-import './App.css'
+import { useState } from 'react';
+import './App.css';
+import Dashboard from './components/Dashboard';
+import Agents from './components/Agents';
+import Events from './components/Events';
+import Sessions from './components/Sessions';
+import Login from './components/Login';
+import Sidebar from './components/Sidebar';
+import { WebSocketProvider } from './context/WebSocketContext';
+import { AuthProvider, useAuth } from './context/AuthContext';
 
-function App() {
-  const [count, setCount] = useState(0)
+function AppContent() {
+  const [currentView, setCurrentView] = useState('dashboard');
+  const { isAuthenticated, logout } = useAuth();
+
+  if (!isAuthenticated) {
+    return <Login />;
+  }
 
   return (
-    <>
-      <div>
-        <a href="https://vite.dev" target="_blank">
-          <img src={viteLogo} className="logo" alt="Vite logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
+    <WebSocketProvider>
+      <div className="app">
+        <Sidebar currentView={currentView} onViewChange={setCurrentView} onLogout={logout} />
+        <main className="main-content">
+          {currentView === 'dashboard' && <Dashboard />}
+          {currentView === 'agents' && <Agents />}
+          {currentView === 'events' && <Events />}
+          {currentView === 'sessions' && <Sessions />}
+        </main>
       </div>
-      <h1>Vite + React</h1>
-      <div className="card">
-        <button onClick={() => setCount((count) => count + 1)}>
-          count is {count}
-        </button>
-        <p>
-          Edit <code>src/App.tsx</code> and save to test HMR
-        </p>
-      </div>
-      <p className="read-the-docs">
-        Click on the Vite and React logos to learn more
-      </p>
-    </>
-  )
+    </WebSocketProvider>
+  );
 }
 
-export default App
+function App() {
+  return (
+    <AuthProvider>
+      <AppContent />
+    </AuthProvider>
+  );
+}
+
+export default App;
