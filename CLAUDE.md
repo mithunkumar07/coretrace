@@ -166,7 +166,7 @@ The agent connects via WS, sends a registration message, then streams SSH/file/c
 
 ---
 
-## Implementation Status — `fix/bugs-001`
+## Implementation Status — v2.0.0 (merged to `main`, released 2026-05-12)
 
 ### Session 1 — MVP bug fixes
 
@@ -224,7 +224,8 @@ All Tier 1 hardening items are complete. Remaining gaps are Tier 2+ (new archite
 
 | Phase | Status | Goal |
 |-------|--------|------|
-| MVP | ✓ Done | SSH + file + auditd command monitoring, session logging, dashboard UI, agent↔dashboard pipeline |
+| MVP (v1.x) | ✓ Released | SSH + file + auditd command monitoring, session logging, dashboard UI |
+| v2.0.0 | ✓ Released | Security hardening, agent↔dashboard pipeline, Tier 1 fixes, 36 unit tests |
 | Phase 2 | Next | eBPF command monitoring, runtime process visibility, container awareness |
 | Phase 3 | Planned | SaaS control plane (multi-tenant), on-prem collector, compliance exports |
 | Phase 4 | Planned | Behavioural baselines, risk scoring, anomaly detection, alerting |
