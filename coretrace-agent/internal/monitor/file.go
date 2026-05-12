@@ -133,7 +133,7 @@ func (fm *FileMonitor) handleFileEvent(event fsnotify.Event) {
 		Permissions: permissions,
 	}
 
-	if operation == "create" {
+	if operation == "create" && fileInfo != nil {
 		// For new files, also add recursive watch if it's a directory
 		if fileInfo.IsDir() {
 			fm.addWatchRecursive(event.Name)

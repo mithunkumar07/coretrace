@@ -8,6 +8,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/coretrace/agent/internal/dashboard"
 	"github.com/coretrace/agent/internal/logger"
 	"github.com/coretrace/agent/internal/monitor"
 	"github.com/coretrace/agent/internal/types"
@@ -31,7 +32,6 @@ func init() {
 }
 
 func startMonitoring() {
-	// Initialize logger from config
 	zapLogger, err := logger.NewLoggerFromConfig()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to initialize logger: %v\n", err)
@@ -42,16 +42,13 @@ func startMonitoring() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Setup signal handling
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Create event channels
 	sshEventChan := make(chan types.SSHEvent, 1000)
 	fileEventChan := make(chan types.FileEvent, 1000)
 	cmdEventChan := make(chan types.CommandEvent, 1000)
 
-	// Initialize session logger
 	sessionsDir := viper.GetString("session_logging.sessions_dir")
 	if sessionsDir == "" {
 		sessionsDir = "/var/log/coretrace/sessions"
@@ -63,8 +60,6 @@ func startMonitoring() {
 		MaxAge:     viper.GetInt("session_logging.rotation.max_age_days"),
 		Compress:   viper.GetBool("session_logging.rotation.compress"),
 	}
-
-	// Set defaults if not configured
 	if rotationConfig.MaxSize == 0 {
 		rotationConfig.MaxSize = 100
 	}
@@ -75,32 +70,63 @@ func startMonitoring() {
 		rotationConfig.MaxAge = 30
 	}
 
-	sessionLogger, err := logger.NewSessionLogger(zapLogger, sessionsDir, rotationConfig)
+	diskConfig := logger.DiskManagementConfig{
+		MaxDirSizeBytes:  int64(viper.GetInt("disk_management.max_sessions_size_gb")) * 1024 * 1024 * 1024,
+		DiskThresholdPct: viper.GetInt("disk_management.usage_threshold_percent"),
+	}
+	if diskConfig.MaxDirSizeBytes == 0 {
+		diskConfig.MaxDirSizeBytes = 10 * 1024 * 1024 * 1024
+	}
+	if diskConfig.DiskThresholdPct == 0 {
+		diskConfig.DiskThresholdPct = 90
+	}
+
+	sessionLogger, err := logger.NewSessionLogger(zapLogger, sessionsDir, rotationConfig, diskConfig)
 	if err != nil {
 		zapLogger.Fatal("Failed to create session logger", zap.Error(err))
 	}
 	defer sessionLogger.Close()
 
-	// Initialize monitors
+	// Dashboard client — optional, wired when dashboard.enabled + url + api_key are set
+	var dashClient *dashboard.Client
+	if viper.GetBool("dashboard.enabled") {
+		dashURL := viper.GetString("dashboard.url")
+		dashAPIKey := viper.GetString("dashboard.api_key")
+		if dashURL != "" && dashAPIKey != "" {
+			agentID := viper.GetString("dashboard.agent_id")
+			if agentID == "" {
+				agentID, _ = os.Hostname()
+			}
+			dashClient = dashboard.NewClient(zapLogger, dashURL, dashAPIKey, agentID)
+			if err := dashClient.Start(ctx); err != nil {
+				zapLogger.Error("Failed to start dashboard client", zap.Error(err))
+				dashClient = nil
+			} else {
+				zapLogger.Info("Dashboard client started",
+					zap.String("url", dashURL),
+					zap.String("agent_id", agentID))
+				defer dashClient.Stop()
+				go applyConfigUpdates(ctx, zapLogger, dashClient.ConfigUpdates())
+			}
+		} else {
+			zapLogger.Warn("Dashboard enabled but url/api_key missing, skipping")
+		}
+	}
+
 	sshMonitor := monitor.NewSSHMonitor(zapLogger, sshEventChan)
 	fileMonitor, err := monitor.NewFileMonitor(zapLogger, fileEventChan)
 	if err != nil {
 		zapLogger.Fatal("Failed to create file monitor", zap.Error(err))
 	}
-
-	// Initialize command monitor (requires auditd)
 	debug := viper.GetBool("agent.debug")
 	cmdMonitor := monitor.NewCommandMonitor(zapLogger, cmdEventChan, debug)
 
-	// Start monitors
 	if err := sshMonitor.Start(ctx); err != nil {
 		zapLogger.Fatal("Failed to start SSH monitor", zap.Error(err))
 	}
-
 	if err := fileMonitor.Start(ctx); err != nil {
 		zapLogger.Fatal("Failed to start file monitor", zap.Error(err))
 	}
-
 	if err := cmdMonitor.Start(ctx); err != nil {
 		zapLogger.Fatal("Failed to start command monitor", zap.Error(err))
 	}
@@ -112,10 +138,8 @@ func startMonitoring() {
 		zap.Int("rotation_max_age_days", rotationConfig.MaxAge),
 		zap.Bool("rotation_compress", rotationConfig.Compress))
 
-	// Start event processor with session logger and command monitor
-	go processEvents(ctx, zapLogger, sessionLogger, cmdMonitor, sshEventChan, fileEventChan, cmdEventChan)
+	go processEvents(ctx, zapLogger, sessionLogger, cmdMonitor, dashClient, sshEventChan, fileEventChan, cmdEventChan)
 
-	// Start session cleanup routine
 	cleanupInterval := viper.GetDuration("session_logging.cleanup_interval")
 	if cleanupInterval == 0 {
 		cleanupInterval = 1 * time.Hour
@@ -126,43 +150,53 @@ func startMonitoring() {
 	}
 	go sessionCleanupRoutine(ctx, zapLogger, sessionLogger, cleanupInterval, maxSessionDuration)
 
-	// Wait for shutdown signal
 	<-sigChan
 	zapLogger.Info("Shutting down CoreTrace agent...")
 
 	cancel()
-
-	// Give some time for cleanup
 	time.Sleep(2 * time.Second)
 
-	// Stop file monitor
 	if err := fileMonitor.Stop(); err != nil {
 		zapLogger.Error("Error stopping file monitor", zap.Error(err))
+	}
+	if err := cmdMonitor.Stop(); err != nil {
+		zapLogger.Error("Error stopping command monitor", zap.Error(err))
 	}
 
 	zapLogger.Info("CoreTrace agent stopped")
 }
 
-func processEvents(ctx context.Context, zapLogger *zap.Logger, sessionLogger *logger.SessionLogger, cmdMonitor *monitor.CommandMonitor,
+func processEvents(
+	ctx context.Context,
+	zapLogger *zap.Logger,
+	sessionLogger *logger.SessionLogger,
+	cmdMonitor *monitor.CommandMonitor,
+	dashClient *dashboard.Client,
 	sshEventChan <-chan types.SSHEvent,
 	fileEventChan <-chan types.FileEvent,
-	cmdEventChan <-chan types.CommandEvent) {
-
+	cmdEventChan <-chan types.CommandEvent,
+) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case sshEvent := <-sshEventChan:
-			handleSSHEvent(zapLogger, sessionLogger, cmdMonitor, sshEvent)
+			handleSSHEvent(zapLogger, sessionLogger, cmdMonitor, dashClient, sshEvent)
 		case fileEvent := <-fileEventChan:
-			handleFileEvent(zapLogger, sessionLogger, fileEvent)
+			handleFileEvent(zapLogger, sessionLogger, dashClient, fileEvent)
 		case cmdEvent := <-cmdEventChan:
-			handleCommandEvent(zapLogger, sessionLogger, cmdEvent)
+			handleCommandEvent(zapLogger, sessionLogger, dashClient, cmdEvent)
 		}
 	}
 }
 
-func handleSSHEvent(zapLogger *zap.Logger, sessionLogger *logger.SessionLogger, cmdMonitor *monitor.CommandMonitor, event types.SSHEvent) {
+func handleSSHEvent(
+	zapLogger *zap.Logger,
+	sessionLogger *logger.SessionLogger,
+	cmdMonitor *monitor.CommandMonitor,
+	dashClient *dashboard.Client,
+	event types.SSHEvent,
+) {
 	switch event.EventType {
 	case types.EventSSHLogin:
 		if event.Success {
@@ -175,13 +209,20 @@ func handleSSHEvent(zapLogger *zap.Logger, sessionLogger *logger.SessionLogger, 
 				zap.Int("pid", event.PID),
 				zap.Time("timestamp", event.Timestamp),
 			)
-			// Start session logging
 			if err := sessionLogger.StartSession(event); err != nil {
 				zapLogger.Error("Failed to start session log", zap.Error(err))
 			}
-			// Register session PID for command tracking
 			if event.PID > 0 {
 				cmdMonitor.RegisterSession(event.SessionID, event.PID)
+			}
+			if dashClient != nil {
+				dashClient.SendEvent("ssh_login", event.SessionID, map[string]interface{}{
+					"username":        event.Username,
+					"source_ip":       event.SourceIP,
+					"auth_method":     event.AuthMethod,
+					"key_fingerprint": event.KeyFingerprint,
+					"pid":             event.PID,
+				}, "info")
 			}
 		} else {
 			zapLogger.Warn("SSH Login failed",
@@ -190,29 +231,52 @@ func handleSSHEvent(zapLogger *zap.Logger, sessionLogger *logger.SessionLogger, 
 				zap.String("auth_method", event.AuthMethod),
 				zap.Time("timestamp", event.Timestamp),
 			)
+			if dashClient != nil {
+				dashClient.SendEvent("ssh_failed", event.SessionID, map[string]interface{}{
+					"username":    event.Username,
+					"source_ip":   event.SourceIP,
+					"auth_method": event.AuthMethod,
+				}, "warning")
+			}
 		}
+
 	case types.EventSSHLogout:
 		zapLogger.Info("SSH Logout detected",
 			zap.String("session_id", event.SessionID),
 			zap.String("username", event.Username),
 			zap.Time("timestamp", event.Timestamp),
 		)
-		// End session logging
 		if err := sessionLogger.EndSession(event.SessionID, event.Timestamp); err != nil {
 			zapLogger.Error("Failed to end session log", zap.Error(err))
 		}
-		// Unregister session from command monitor
 		cmdMonitor.UnregisterSession(event.SessionID)
+		if dashClient != nil {
+			dashClient.SendEvent("ssh_logout", event.SessionID, map[string]interface{}{
+				"username": event.Username,
+			}, "info")
+		}
+
 	case types.EventSSHFailed:
 		zapLogger.Warn("SSH Failed attempt",
 			zap.String("username", event.Username),
 			zap.String("source_ip", event.SourceIP),
 			zap.Time("timestamp", event.Timestamp),
 		)
+		if dashClient != nil {
+			dashClient.SendEvent("ssh_failed", "", map[string]interface{}{
+				"username":  event.Username,
+				"source_ip": event.SourceIP,
+			}, "warning")
+		}
 	}
 }
 
-func handleFileEvent(zapLogger *zap.Logger, sessionLogger *logger.SessionLogger, event types.FileEvent) {
+func handleFileEvent(
+	zapLogger *zap.Logger,
+	sessionLogger *logger.SessionLogger,
+	dashClient *dashboard.Client,
+	event types.FileEvent,
+) {
 	zapLogger.Info("File activity detected",
 		zap.String("file_path", event.FilePath),
 		zap.String("operation", event.Operation),
@@ -220,17 +284,27 @@ func handleFileEvent(zapLogger *zap.Logger, sessionLogger *logger.SessionLogger,
 		zap.String("session_id", event.SessionID),
 		zap.Time("timestamp", event.Timestamp),
 	)
-
-	// Log to session if associated with a session
 	if event.SessionID != "" {
 		if err := sessionLogger.LogFileEvent(event.SessionID, event); err != nil {
-			// This is expected for events not associated with tracked sessions
 			zapLogger.Debug("Failed to log file event to session", zap.Error(err))
 		}
 	}
+	if dashClient != nil {
+		eventType := "file_" + event.Operation
+		dashClient.SendEvent(eventType, event.SessionID, map[string]interface{}{
+			"file_path": event.FilePath,
+			"operation": event.Operation,
+			"username":  event.Username,
+		}, "info")
+	}
 }
 
-func handleCommandEvent(zapLogger *zap.Logger, sessionLogger *logger.SessionLogger, event types.CommandEvent) {
+func handleCommandEvent(
+	zapLogger *zap.Logger,
+	sessionLogger *logger.SessionLogger,
+	dashClient *dashboard.Client,
+	event types.CommandEvent,
+) {
 	zapLogger.Info("Command executed",
 		zap.String("session_id", event.SessionID),
 		zap.String("username", event.Username),
@@ -241,11 +315,39 @@ func handleCommandEvent(zapLogger *zap.Logger, sessionLogger *logger.SessionLogg
 		zap.Int("ppid", event.PPID),
 		zap.Time("timestamp", event.Timestamp),
 	)
-
-	// Log to session if associated with a session
 	if event.SessionID != "" {
 		if err := sessionLogger.LogCommand(event.SessionID, event); err != nil {
 			zapLogger.Debug("Failed to log command to session", zap.Error(err))
+		}
+	}
+	if dashClient != nil {
+		dashClient.SendEvent("command", event.SessionID, map[string]interface{}{
+			"username":    event.Username,
+			"command":     event.Command,
+			"args":        event.Args,
+			"working_dir": event.WorkingDir,
+			"pid":         event.PID,
+			"ppid":        event.PPID,
+		}, "info")
+	}
+}
+
+// applyConfigUpdates listens for config payloads from the dashboard and applies them via viper.
+func applyConfigUpdates(ctx context.Context, zapLogger *zap.Logger, updates <-chan map[string]interface{}) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case cfg, ok := <-updates:
+			if !ok {
+				return
+			}
+			for key, value := range cfg {
+				viper.Set(key, value)
+				zapLogger.Info("Config updated from dashboard",
+					zap.String("key", key),
+					zap.Any("value", value))
+			}
 		}
 	}
 }
@@ -254,6 +356,12 @@ func sessionCleanupRoutine(ctx context.Context, zapLogger *zap.Logger, sessionLo
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	diskCheckTicker := time.NewTicker(5 * time.Minute)
+	defer diskCheckTicker.Stop()
+
+	dirCleanupTicker := time.NewTicker(24 * time.Hour)
+	defer dirCleanupTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -261,7 +369,23 @@ func sessionCleanupRoutine(ctx context.Context, zapLogger *zap.Logger, sessionLo
 		case <-ticker.C:
 			sessionLogger.CleanupOldSessions(maxDuration)
 			activeSessions := sessionLogger.GetActiveSessions()
-			zapLogger.Info("Session cleanup completed", zap.Int("active_sessions", len(activeSessions)))
+			dirSize := sessionLogger.GetDirectorySize()
+			zapLogger.Info("Session cleanup completed",
+				zap.Int("active_sessions", len(activeSessions)),
+				zap.Int64("sessions_dir_size_bytes", dirSize),
+				zap.Bool("write_enabled", sessionLogger.IsWriteEnabled()))
+		case <-diskCheckTicker.C:
+			if err := sessionLogger.CheckDiskSpace(); err != nil {
+				zapLogger.Error("Failed to check disk space", zap.Error(err))
+			}
+		case <-dirCleanupTicker.C:
+			retentionDays := viper.GetInt("session_logging.retention_days")
+			if retentionDays == 0 {
+				retentionDays = 30
+			}
+			if err := sessionLogger.CleanupOldDirectories(retentionDays); err != nil {
+				zapLogger.Error("Failed to cleanup old directories", zap.Error(err))
+			}
 		}
 	}
 }
