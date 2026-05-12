@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
+import { useAuth } from '../context/AuthContext';
 import type { Agent } from '../types';
-
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8080';
+import { API_BASE, apiFetch } from '../utils/api';
 
 const STATUS_CLASS: Record<string, string> = {
   online: 'badge-success',
@@ -21,19 +21,20 @@ function formatLastSeen(ts: string) {
 export default function Agents() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [loading, setLoading] = useState(true);
+  const { token } = useAuth();
 
-  const load = () => {
-    fetch(`${API_BASE}/api/v1/agents`)
+  const load = useCallback(() => {
+    apiFetch(`${API_BASE}/api/v1/agents`, token)
       .then(r => r.json())
       .then(data => { setAgents(Array.isArray(data) ? data : []); setLoading(false); })
       .catch(() => setLoading(false));
-  };
+  }, [token]);
 
   useEffect(() => {
     load();
     const interval = setInterval(load, 10000);
     return () => clearInterval(interval);
-  }, []);
+  }, [load]);
 
   return (
     <div className="view">

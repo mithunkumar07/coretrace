@@ -21,7 +21,11 @@ export function WebSocketProvider({ children }: { children: ReactNode }) {
   const connect = () => {
     if (!mountedRef.current) return;
     try {
-      const ws = new WebSocket(`${WS_URL}/ws/dashboard`);
+      const token = localStorage.getItem('ct_token');
+      const wsURL = token
+        ? `${WS_URL}/ws/dashboard?token=${encodeURIComponent(token)}`
+        : `${WS_URL}/ws/dashboard`;
+      const ws = new WebSocket(wsURL);
       wsRef.current = ws;
 
       ws.onopen = () => {

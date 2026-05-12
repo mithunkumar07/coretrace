@@ -1,15 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import type { Event } from '../types';
 import { useWebSocket } from '../context/WebSocketContext';
-
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8080';
-
-const SEVERITY_CLASS: Record<string, string> = {
-  info: 'badge-info',
-  warning: 'badge-warning',
-  error: 'badge-error',
-  critical: 'badge-critical',
-};
+import { useAuth } from '../context/AuthContext';
+import { API_BASE, SEVERITY_CLASS, apiFetch } from '../utils/api';
 
 export default function Events() {
   const [events, setEvents] = useState<Event[]>([]);
@@ -17,18 +10,19 @@ export default function Events() {
   const [filterType, setFilterType] = useState('');
   const [filterSeverity, setFilterSeverity] = useState('');
   const { recentEvents } = useWebSocket();
+  const { token } = useAuth();
 
-  const load = () => {
+  const load = useCallback(() => {
     const params = new URLSearchParams();
     if (filterType) params.set('type', filterType);
     if (filterSeverity) params.set('severity', filterSeverity);
-    fetch(`${API_BASE}/api/v1/events?${params}`)
+    apiFetch(`${API_BASE}/api/v1/events?${params}`, token)
       .then(r => r.json())
       .then(data => { setEvents(data.events || []); setLoading(false); })
       .catch(() => setLoading(false));
-  };
+  }, [filterType, filterSeverity, token]);
 
-  useEffect(() => { load(); }, [filterType, filterSeverity]);
+  useEffect(() => { load(); }, [load]);
 
   // Merge live WS events in real-time
   useEffect(() => {

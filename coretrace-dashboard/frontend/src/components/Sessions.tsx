@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
+import { useAuth } from '../context/AuthContext';
 import type { Session } from '../types';
-
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8080';
+import { API_BASE, apiFetch } from '../utils/api';
 
 const STATUS_CLASS: Record<string, string> = {
   active: 'badge-success',
@@ -22,22 +22,23 @@ export default function Sessions() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
   const [view, setView] = useState<'all' | 'active'>('all');
+  const { token } = useAuth();
 
-  const load = () => {
+  const load = useCallback(() => {
     const url = view === 'active'
       ? `${API_BASE}/api/v1/sessions/active`
       : `${API_BASE}/api/v1/sessions`;
-    fetch(url)
+    apiFetch(url, token)
       .then(r => r.json())
       .then(data => { setSessions(Array.isArray(data) ? data : []); setLoading(false); })
       .catch(() => setLoading(false));
-  };
+  }, [view, token]);
 
   useEffect(() => {
     load();
     const t = setInterval(load, 10000);
     return () => clearInterval(t);
-  }, [view]);
+  }, [load]);
 
   return (
     <div className="view">

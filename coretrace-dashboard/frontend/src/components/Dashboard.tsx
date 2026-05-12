@@ -1,23 +1,17 @@
 import { useEffect, useState } from 'react';
 import { useWebSocket } from '../context/WebSocketContext';
+import { useAuth } from '../context/AuthContext';
 import type { DashboardStats, Event } from '../types';
-
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8080';
-
-const SEVERITY_CLASS: Record<string, string> = {
-  info: 'badge-info',
-  warning: 'badge-warning',
-  error: 'badge-error',
-  critical: 'badge-critical',
-};
+import { API_BASE, SEVERITY_CLASS, apiFetch } from '../utils/api';
 
 export default function Dashboard() {
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const { connected, recentEvents } = useWebSocket();
+  const { token } = useAuth();
 
   useEffect(() => {
     const load = () => {
-      fetch(`${API_BASE}/api/v1/stats`)
+      apiFetch(`${API_BASE}/api/v1/stats`, token)
         .then(r => r.json())
         .then(setStats)
         .catch(() => {});
@@ -25,7 +19,7 @@ export default function Dashboard() {
     load();
     const interval = setInterval(load, 15000);
     return () => clearInterval(interval);
-  }, []);
+  }, [token]);
 
   return (
     <div className="view">

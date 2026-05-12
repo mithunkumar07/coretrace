@@ -1,14 +1,10 @@
 package api
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/json"
-	"fmt"
 	"net/http"
-	"time"
+	"strings"
 
+	"github.com/coretrace/dashboard/internal/auth"
 	"github.com/coretrace/dashboard/internal/models"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
@@ -48,20 +44,25 @@ func handleLogin(db *gorm.DB, jwtSecret string) gin.HandlerFunc {
 			return
 		}
 
-		token := signToken(user.ID.String(), jwtSecret)
+		token := auth.SignToken(user.ID.String(), jwtSecret)
 		c.JSON(http.StatusOK, loginResponse{Token: token, User: user})
 	}
 }
 
-// signToken creates a simple HMAC-signed token: base64(payload).base64(sig)
-func signToken(userID string, secret string) string {
-	payload, _ := json.Marshal(map[string]interface{}{
-		"sub": userID,
-		"exp": time.Now().Add(24 * time.Hour).Unix(),
-	})
-	encoded := base64.RawURLEncoding.EncodeToString(payload)
-	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write([]byte(encoded))
-	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-	return fmt.Sprintf("%s.%s", encoded, sig)
+// AuthMiddleware validates HMAC-signed Bearer tokens on protected routes.
+func AuthMiddleware(jwtSecret string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		header := c.GetHeader("Authorization")
+		if !strings.HasPrefix(header, "Bearer ") {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Authorization required"})
+			return
+		}
+		userID, err := auth.VerifyToken(strings.TrimPrefix(header, "Bearer "), jwtSecret)
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired token"})
+			return
+		}
+		c.Set("user_id", userID)
+		c.Next()
+	}
 }

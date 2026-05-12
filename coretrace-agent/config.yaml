@@ -6,6 +6,16 @@ agent:
   version: "1.0.0"
   debug: false
 
+# Dashboard connection settings
+dashboard:
+  enabled: false
+  # URL of the CoreTrace dashboard API (http or https)
+  url: "http://localhost:8080"
+  # API key generated when the agent was registered (POST /api/v1/agents)
+  api_key: ""
+  # Optional: override the agent ID sent during registration (defaults to hostname)
+  agent_id: ""
+
 # Command monitoring settings (requires auditd)
 command_monitoring:
   enabled: true

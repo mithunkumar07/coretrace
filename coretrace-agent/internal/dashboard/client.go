@@ -2,6 +2,7 @@ package dashboard
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -21,6 +22,7 @@ type Client struct {
 	dashboardURL string
 	conn         *websocket.Conn
 	eventChan    chan types.DashboardEventMessage
+	configChan   chan map[string]interface{}
 	stopChan     chan struct{}
 	mu           sync.RWMutex
 	connected    bool
@@ -35,8 +37,14 @@ func NewClient(logger *zap.Logger, dashboardURL, apiKey, agentID string) *Client
 		dashboardURL: dashboardURL,
 		agentID:      agentID,
 		eventChan:    make(chan types.DashboardEventMessage, 1000),
+		configChan:   make(chan map[string]interface{}, 16),
 		stopChan:     make(chan struct{}),
 	}
+}
+
+// ConfigUpdates returns a channel that receives config update payloads sent by the dashboard.
+func (c *Client) ConfigUpdates() <-chan map[string]interface{} {
+	return c.configChan
 }
 
 // Start begins the connection to dashboard and starts event streaming
@@ -279,7 +287,8 @@ func (c *Client) sendJSON(v interface{}) error {
 	return conn.WriteJSON(v)
 }
 
-// waitForDisconnect blocks until connection is lost
+// waitForDisconnect reads from the connection until it drops.
+// Dispatches incoming config messages to configChan.
 func (c *Client) waitForDisconnect() {
 	c.mu.RLock()
 	conn := c.conn
@@ -289,14 +298,26 @@ func (c *Client) waitForDisconnect() {
 		return
 	}
 
-	// Read messages until error (disconnection)
 	for {
-		_, _, err := conn.ReadMessage()
+		_, data, err := conn.ReadMessage()
 		if err != nil {
 			c.mu.Lock()
 			c.connected = false
 			c.mu.Unlock()
 			return
+		}
+		var msg map[string]interface{}
+		if err := json.Unmarshal(data, &msg); err != nil {
+			continue
+		}
+		if msgType, _ := msg["type"].(string); msgType == "config" {
+			if cfg, ok := msg["config"].(map[string]interface{}); ok {
+				select {
+				case c.configChan <- cfg:
+				default:
+					c.logger.Warn("Config update channel full, dropping update")
+				}
+			}
 		}
 	}
 }
